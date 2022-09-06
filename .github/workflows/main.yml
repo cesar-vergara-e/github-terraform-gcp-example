@@ -1,0 +1,120 @@
+name: "Terraform"
+
+on:
+  push:
+    branches:
+      - 'master'
+      - 'develop'
+  pull_request:
+
+permissions:
+  contents: 'read'
+  id-token: 'write'
+
+jobs:
+  Trufflehog:
+    runs-on: ubuntu-latest
+    name: Trufflehog
+    steps:
+      - uses: actions/checkout@v3
+      - uses: UnicornGlobal/trufflehog-actions-scan@v1.0.0
+        with:
+          branch: ${{ github.head_ref }}
+  
+  Checkov:
+    runs-on: ubuntu-latest
+    name: Checkov
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@master
+
+      - name: Run Checkov action
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          quiet: true 
+          soft_fail: true
+          framework: terraform
+          output_format: json
+  
+  DeployKubernetes:
+    name: "Terraform"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: 'actions/checkout@v3'
+      - id: 'auth'
+        name: 'Authenticate to GCP'
+        uses: 'google-github-actions/auth@v0'
+        with:
+          create_credentials_file: true
+          workload_identity_provider: ${{ secrets.workload_identity_provider }}
+          service_account: my-service-account@demos-361500.iam.gserviceaccount.com
+      
+      - name: copy credential file
+        run: |
+          cp ${{ steps.auth.outputs.credentials_file_path }} infrastructure/credential.json
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_TOKEN }}
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform -chdir=infrastructure fmt -check
+        
+
+      - name: Terraform - Setup Custom variables
+        id: vars
+        run: |
+          cat > infrastructure/pipeline.auto.tfvars<<EOF
+          credentials = "credential.json"
+          EOF
+
+      - name: Terraform Init
+        id: init
+        run: terraform -chdir=infrastructure init -upgrade
+        
+      - name: Terraform Validate
+        id: validate
+        run: terraform -chdir=infrastructure validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'pull_request'
+        run: terraform -chdir=infrastructure plan -no-color
+        continue-on-error: true
+          
+      - uses: actions/github-script@0.9.0
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outputs.stdout }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            <details><summary>Show Plan</summary>
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+            </details>
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Terraform Apply
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop') && github.event_name == 'push'
+        run: terraform -chdir=infrastructure apply 
+        
